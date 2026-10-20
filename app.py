@@ -1,6 +1,9 @@
 import streamlit as st
 import numpy as np
-import tensorflow as tf
+import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torchvision.models import MobileNet_V2_Weights
 from PIL import Image
 import matplotlib.pyplot as plt
 
@@ -17,31 +20,61 @@ div.stButton>button{background:#ad68ff;color:#100b19;border:0;border-radius:10px
 
 @st.cache_resource(show_spinner="Loading pretrained MobileNetV2…")
 def load_model():
-    model = tf.keras.applications.MobileNetV2(weights="imagenet")
-    grad_model = tf.keras.models.Model(model.inputs, [model.get_layer("out_relu").output, model.output])
-    return model, grad_model
+    weights = MobileNet_V2_Weights.DEFAULT
+    model = models.mobilenet_v2(weights=weights)
+    model.eval()
+    target_layer = model.features[-1]
+    categories = weights.meta["categories"]
+    return model, target_layer, categories
 
 def prepare(image):
-    resized = image.convert("RGB").resize((224,224))
-    batch = np.expand_dims(np.asarray(resized, dtype=np.float32), axis=0)
-    return tf.keras.applications.mobilenet_v2.preprocess_input(batch), resized
+    resized = image.convert("RGB").resize((224, 224))
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    tensor = transform(resized).unsqueeze(0)
+    return tensor, resized
 
-def gradcam(grad_model, batch, class_idx):
-    with tf.GradientTape() as tape:
-        conv, pred = grad_model(batch, training=False)
-        score = pred[:, class_idx]
-    grads = tape.gradient(score, conv)
-    weights = tf.reduce_mean(grads, axis=(1,2))
-    cam = tf.reduce_sum(conv[0] * weights[0], axis=-1)
-    cam = tf.maximum(cam, 0)
-    cam = cam / (tf.reduce_max(cam) + tf.keras.backend.epsilon())
-    return tf.image.resize(cam[...,None], (224,224)).numpy().squeeze()
+def gradcam(model, target_layer, tensor, class_idx):
+    activations = []
+    gradients = []
+
+    def forward_hook(module, input, output):
+        activations.append(output)
+
+    def backward_hook(module, grad_input, grad_output):
+        gradients.append(grad_output[0])
+
+    h_fwd = target_layer.register_forward_hook(forward_hook)
+    h_bwd = target_layer.register_full_backward_hook(backward_hook)
+
+    try:
+        model.zero_grad()
+        output = model(tensor)
+        score = output[0, class_idx]
+        score.backward()
+
+        weights = torch.mean(gradients[0], dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * activations[0], dim=1, keepdim=True)
+        cam = torch.relu(cam)
+        cam = torch.nn.functional.interpolate(cam, size=(224, 224), mode="bilinear", align_corners=False)
+        cam = cam.squeeze().detach().cpu().numpy()
+        cam_max = np.max(cam)
+        if cam_max > 1e-8:
+            cam = cam / cam_max
+        else:
+            cam = np.zeros_like(cam)
+        return cam
+    finally:
+        h_fwd.remove()
+        h_bwd.remove()
 
 def overlay(image, heatmap):
-    original = np.asarray(image.resize((224,224)), dtype=np.float32) / 255
-    colored = plt.get_cmap("jet")(heatmap)[...,:3]
-    blended = np.clip(0.58*original + 0.42*colored, 0, 1)
-    return Image.fromarray((blended*255).astype(np.uint8))
+    original = np.asarray(image.resize((224, 224)), dtype=np.float32) / 255.0
+    colored = plt.get_cmap("jet")(heatmap)[..., :3]
+    blended = np.clip(0.58 * original + 0.42 * colored, 0, 1)
+    return Image.fromarray((blended * 255).astype(np.uint8))
 
 st.title("🔍 VisionExplain AI")
 st.subheader("Explain My Image Classification")
@@ -56,9 +89,9 @@ with st.sidebar:
     st.write("**Explanation:** Grad-CAM")
     st.info("Use a clear photo of a common object, animal, vehicle, or food.")
 
-uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png"])
+uploaded = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
 if uploaded is None:
-    a,b,c = st.columns(3)
+    a, b, c = st.columns(3)
     a.metric("Step 1", "Upload image")
     b.metric("Step 2", "Predict class")
     c.metric("Step 3", "Explain regions")
@@ -68,23 +101,31 @@ else:
         image = Image.open(uploaded).convert("RGB")
         st.image(image, caption="Uploaded image", use_container_width=True)
         with st.spinner("Classifying image and generating Grad-CAM…"):
-            model, grad_model = load_model()
+            model, target_layer, categories = load_model()
             batch, resized = prepare(image)
-            pred = model(batch, training=False).numpy()[0]
-            top_idx = np.argsort(pred)[::-1][:3]
-            decoded = tf.keras.applications.mobilenet_v2.decode_predictions(pred[None,:], top=3)[0]
-            cam = gradcam(grad_model, batch, int(top_idx[0]))
+            with torch.no_grad():
+                init_out = model(batch)
+                init_probs = torch.softmax(init_out, dim=1)[0]
+                top_probs, top_indices = torch.topk(init_probs, 3)
+
+            top_class = int(top_indices[0].item())
+            cam = gradcam(model, target_layer, batch, top_class)
             explanation = overlay(resized, cam)
+
+            decoded = [
+                (None, categories[idx.item()], float(prob.item()))
+                for idx, prob in zip(top_indices, top_probs)
+            ]
 
         left, right = st.columns(2, gap="large")
         with left:
             st.subheader("Prediction")
-            st.metric("Predicted class", decoded[0][1].replace("_"," ").title())
+            st.metric("Predicted class", decoded[0][1].replace("_", " ").title())
             st.metric("Model score", f"{decoded[0][2]*100:.1f}%")
             st.caption("A model score is not a guarantee of correctness.")
             st.markdown("**Top 3 predictions**")
             for _, label, score in decoded:
-                st.write(f"{label.replace('_',' ').title()} — {score*100:.1f}%")
+                st.write(f"{label.replace('_', ' ').title()} — {score*100:.1f}%")
         with right:
             st.subheader("Grad-CAM explanation")
             st.image(explanation, caption="Warmer regions indicate stronger association with the selected class score.", use_container_width=True)
